@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>粒子爱心</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: #000; overflow: hidden;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: none;
+    user-select: none; -webkit-user-select: none;
+  }
+  #stage { position: fixed; inset: 0; display: block; background: #000; }
+  #hint {
+    position: fixed; left: 0; right: 0;
+    bottom: calc(24px + env(safe-area-inset-bottom, 0px));
+    text-align: center;
+    font: 15px/1.4 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: #8cb4e6; letter-spacing: 1px;
+    pointer-events: none; opacity: .85;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="hint">轻触屏幕，让爱心化作文字</div>
+<script>
+"use strict";
+/* 兼容被嵌入 iframe 的场景：用 JS 再补一次 viewport */
+(function(){
+  var m = document.createElement('meta');
+  m.name = 'viewport';
+  m.content = 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover';
+  document.head.appendChild(m);
+})();
+/* ================= 可调参数 ================= */
+var TEXT_CONTENT = "I LOVE YOU";   // 想写的名字，如 "I LOVE 小红"
+var HEART_DEPTH = 165, HEART_SIZE = 235, TEXT_DEPTH = 56;
+var HEART_Y_SHIFT = -30, FOCAL0 = 720;
+var GATHER_TIME = 2.4, MORPH_TIME = 3.2;
+var SWAY_DEG = 70, SWAY_SPEED = 0.7;
+/* =========================================== */
+
+var stage = document.getElementById('stage');
+var bg = stage.getContext('2d');
+var hintEl = document.getElementById('hint');
+var dpr = Math.min(window.devicePixelRatio || 1, 2);
+var W = 0, H = 0, CX = 0, CY = 0, S = 1, FOCAL = FOCAL0;
+var isPhone = false;
+
+/* ---------- 3D 心形隐式方程 ---------- */
+function heartF(x, y, z) {
+  var a = x*x + 2.25*z*z + y*y - 1.0;
+  return a*a*a - x*x*y*y*y - 0.1125*z*z*y*y*y;
+}
+
+function implicitRadius(th) {
+  var cx = Math.cos(th), sy = Math.sin(th), lo = 0, hi = 1.9, mid;
+  for (var i = 0; i < 22; i++) {
+    mid = (lo + hi) / 2;
+    if (heartF(mid*cx, mid*sy, 0) <= 0) lo = mid; else hi = mid;
+  }
+  return lo;
+}
+
+/* ---------- 径向映射表：隐式心形正面 -> 参数方程爱心 ---------- */
+var TN = 720, RADIAL = new Float64Array(TN);
+(function buildTable() {
+  var pts = [];
+  for (var i = 0; i < 1440; i++) {
+    var t = i / 1440 * Math.PI * 2;
+    var px = 16 * Math.pow(Math.sin(t), 3) / 17;
+    var py = (13*Math.cos(t) - 5*Math.cos(2*t) - 2*Math.cos(3*t) - Math.cos(4*t)) / 17;
+    pts.push({a: Math.atan2(py, px), r: Math.hypot(px, py)});
+  }
+  pts.sort(function(p, q) { return p.a - q.a; });
+  for (var j = 0; j < TN; j++) {
+    var ang = j / TN * Math.PI * 2 - Math.PI;
+    if (ang < pts[0].a) ang += Math.PI * 2;
+    var lo2 = 0, hi2 = pts.length - 1;
+    while (lo2 < hi2) {
+      var m = (lo2 + hi2) >> 1;
+      if (pts[m].a < ang) lo2 = m + 1; else hi2 = m;
+    }
+    var b = pts[(lo2 - 1 + pts.length) % pts.length];
+    var c2 = pts[lo2 % pts.length];
+    var k = (c2.a === b.a) ? 0 : (ang - b.a) / (c2.a - b.a);
+    var rp = b.r + (c2.r - b.r) * k;
+    RADIAL[j] = rp / implicitRadius(ang % (Math.PI * 2));
+  }
+})();
+
+function morphXY(x, y) {
+  var r = Math.hypot(x, y);
+  if (r < 1e-7) return [x, y];
+  var ang = Math.atan2(y, x);
+  var u = (ang + Math.PI) / (Math.PI * 2) * TN;
+  var i0 = Math.floor(u) % TN, k = u - Math.floor(u);
+  var f = RADIAL[i0] + (RADIAL[(i0 + 1) % TN] - RADIAL[i0]) * k;
+  return [x * f, y * f];
+}
+
+function sampleVolume(fLo, fHi) {
+  while (true) {
+    var x = Math.random()*2.56 - 1.28;
+    var y = Math.random()*2.34 - 1.06;
+    var z = Math.random()*1.40 - 0.70;
+    var f = heartF(x, y, z);
+    if (f >= fLo && f <= fHi) {
+      var m = morphXY(x, y);
+      return [m[0], m[1], z];
+    }
+  }
+}
+
+function sample2D() {
+  while (true) {
+    var x = Math.random()*2.56 - 1.28;
+    var y = Math.random()*2.34 - 1.06;
+    if (heartF(x, y, 0) <= 0) {
+      var lo = 0, hi = 0.70, mid;
+      if (heartF(x, y, hi) > 0) {
+        for (var i = 0; i < 20; i++) {
+          mid = (lo + hi) / 2;
+          if (heartF(x, y, mid) <= 0) lo = mid; else hi = mid;
+        }
+      } else lo = 0.70;
+      var m = morphXY(x, y);
+      return [m[0], m[1], lo];
+    }
+  }
+}
+
+/* ---------- 粒子 ---------- */
+function Particle(seed, target) {
+  this.seed = seed;
+  this.hshade = seed[3];
+  this.setTarget(target);
+  this.wx = (Math.random()*2 - 1) * W * 0.5;
+  this.wy = (Math.random()*2 - 1) * H * 0.5;
+  this.wz = Math.random()*700 - 450;
+  this.sx = this.wx; this.sy = this.wy; this.sz = this.wz;
+  this.delay = Math.random()*0.9;
+  this.radius = Math.random() < 0.75 ? 1 : 2;
+  this.phase = Math.random() * Math.PI * 2;
+  var bases = [[150,225,255],[175,205,255],[210,240,255],[255,255,255]];
+  this.base = bases[(Math.random()*bases.length)|0];
+  this.shade = 1;
+  this.last = null;
+}
+Particle.prototype.setTarget = function(t) {
+  this.trx = t[0]; this.tryy = t[1]; this.tz = t[2]; this.tshade = t[3];
+};
+
+/* ---------- 文字目标点：前面/后面/侧壁 ---------- */
+var textCanvas = document.createElement('canvas');
+function buildTextTargets(count) {
+  var ctx = textCanvas.getContext('2d');
+  var maxW = (W - 40) / 1.12;
+  var size = Math.min(150, Math.round(W * 0.2));
+  var font = 'bold ' + size + 'px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
+  ctx.font = font;
+  var tw = ctx.measureText(TEXT_CONTENT).width;
+  while (tw > maxW && size > 18) {
+    size -= 6;
+    ctx.font = 'bold ' + size + 'px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
+    tw = ctx.measureText(TEXT_CONTENT).width;
+  }
+  var th = Math.round(size * 1.35);
+  tw = Math.ceil(tw) + 4;
+  textCanvas.width = tw; textCanvas.height = th;
+  ctx.font = 'bold ' + size + 'px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#fff';
+  ctx.fillText(TEXT_CONTENT, 2, th / 2);
+  var img = ctx.getImageData(0, 0, tw, th).data;
+  var mask = new Uint8Array(tw * th), face = [], edge = [];
+  for (var p = 0, idx = 3; p < tw*th; p++, idx += 4) mask[p] = img[idx] > 128 ? 1 : 0;
+  for (var y = 0; y < th; y++) {
+    for (var x = 0; x < tw; x++) {
+      var i = y * tw + x;
+      if (!mask[i]) continue;
+      var rx = x + 2 - tw / 2, ry = y - th / 2;
+      face.push([rx, ry]);
+      var isEdge = (x === 0 || y === 0 || x === tw-1 || y === th-1 ||
+        !mask[i-1] || !mask[i+1] || !mask[i-tw] || !mask[i+tw]);
+      if (isEdge) edge.push([rx, ry]);
+    }
+  }
+  if (!edge.length) edge = face;
+  var halfD = TEXT_DEPTH * S / 2, out = [];
+  for (var q = 0; q < count; q++) {
+    var roll = Math.random();
+    if (roll < 0.45) {
+      var fp = face[(Math.random()*face.length)|0];
+      out.push([fp[0]*S, fp[1]*S, halfD + (Math.random()*3-1.5), 1.0]);
+    } else if (roll < 0.80) {
+      var bp = face[(Math.random()*face.length)|0];
+      out.push([bp[0]*S, bp[1]*S, -halfD + (Math.random()*3-1.5), 0.55]);
+    } else {
+      var ep = edge[(Math.random()*edge.length)|0];
+      out.push([ep[0]*S, ep[1]*S, (Math.random()*2-1)*halfD, 0.8]);
+    }
+  }
+  return out;
+}
+
+/* ---------- 爱心种子 ---------- */
+function buildSeeds(n) {
+  var seeds = [];
+  for (var i = 0; i < n; i++) {
+    var r = Math.random(), v, shade;
+    if (r < 0.40) { v = sampleVolume(-99, 0); shade = 1.0; }
+    else if (r < 0.65) { v = sampleVolume(-0.06, 0); shade = 1.05; }
+    else {
+      v = sample2D();
+      if (Math.random() < 0.55) { v[2] = v[2] * (0.97 + Math.random()*0.03); shade = 1.12; }
+      else { v[2] = -v[2] * (0.97 + Math.random()*0.03); shade = 0.72; }
+    }
+    seeds.push([v[0], v[1], v[2], shade]);
+  }
+  return seeds;
+}
+
+var DEPTH_SCALE, particles, N;
+var state, stateT, rotY, baseRot, swayPhase, SWAY_AMP, beat;
+var TO_HEART = 0, HEART = 1, TO_TEXT = 2, TEXT = 3;
+
+function heartGoal(seed) {
+  var nx = seed[0], ny = seed[1], nz = seed[2];
+  return [nx * HEART_SIZE * S * beat,
+          -ny * HEART_SIZE * S * beat + HEART_Y_SHIFT * S * beat,
+          nz * DEPTH_SCALE * beat];
+}
+function easeIO(k) { return k < 0.5 ? 4*k*k*k : 1 - Math.pow(-2*k + 2, 3)/2; }
+
+function beginMorph() {
+  for (var i = 0; i < particles.length; i++) {
+    var p = particles[i];
+    p.sx = p.wx; p.sy = p.wy; p.sz = p.wz;
+    p.delay = Math.random()*0.9;
+  }
+  if (state === TO_HEART) {
+    var ratio = Math.max(-1, Math.min(1, rotY / SWAY_AMP));
+    swayPhase = Math.asin(ratio);
+  }
+}
+
+function resize() {
+  W = window.innerWidth; H = window.innerHeight;
+  CX = W / 2; CY = H / 2;
+  S = Math.min(W, H) / 650;
+  FOCAL = FOCAL0 * S;
+  DEPTH_SCALE = (HEART_DEPTH / (2/3)) * S;
+  SWAY_AMP = SWAY_DEG * Math.PI / 180;
+  isPhone = Math.min(W, H) < 700;
+  stage.width = Math.round(W * dpr);
+  stage.height = Math.round(H * dpr);
+  stage.style.width = W + 'px';
+  stage.style.height = H + 'px';
+  bg.setTransform(dpr, 0, 0, dpr, 0, 0);
+  bg.fillStyle = '#000';
+  bg.fillRect(0, 0, W, H);
+  if (particles) {
+    var tg = buildTextTargets(N);
+    for (var i = 0; i < N; i++) particles[i].setTarget(tg[i]);
+  }
+}
+
+function init() {
+  N = isPhone ? 1500 : 2200;
+  var seeds = buildSeeds(N);
+  var targets = buildTextTargets(N);
+  particles = [];
+  for (var i = 0; i < N; i++) particles.push(new Particle(seeds[i], targets[i]));
+  state = TO_HEART; stateT = 0; rotY = 0; baseRot = 0; swayPhase = 0;
+}
+
+function project(x, y, z, tiltX) {
+  var ca = Math.cos(rotY), sa = Math.sin(rotY);
+  var x1 = x*ca + z*sa, z1 = -x*sa + z*ca;
+  var cb = Math.cos(tiltX), sb = Math.sin(tiltX);
+  var y2 = y*cb - z1*sb, z2 = y*sb + z1*cb;
+  var persp = FOCAL / (FOCAL + z2);
+  return [CX + x1*persp, CY + y2*persp, persp];
+}
+
+/* ---------- 主循环 ---------- */
+var lastMs = performance.now(), nowS = 0;
+function frame(ms) {
+  var dt = Math.min((ms - lastMs) / 1000, 0.05);
+  lastMs = ms; nowS += dt; stateT += dt;
+
+  if (state === TO_HEART && stateT >= GATHER_TIME) { state = HEART; stateT = 0; }
+  else if (state === TO_TEXT && stateT >= MORPH_TIME) { state = TEXT; stateT = 0; baseRot = rotY; }
+
+  beat = 1 + 0.035 * Math.sin(nowS * 2.2);
+  var tiltX, morphing = (state === TO_HEART || state === TO_TEXT);
+  if (state === HEART || state === TO_HEART) {
+    swayPhase += SWAY_SPEED * dt;
+    rotY = SWAY_AMP * Math.sin(swayPhase);
+    tiltX = 0.12 + 0.04 * Math.sin(nowS * 0.4);
+  } else if (state === TO_TEXT) {
+    rotY += (0 - rotY) * Math.min(1, dt * 2.2);
+    tiltX = 0.09;
+  } else {
+    rotY = baseRot + Math.sin(stateT * 1.2) * 0.18;
+    tiltX = 0.04 + 0.03 * Math.sin(stateT * 0.9);
+  }
+
+  bg.fillStyle = morphing ? 'rgba(0,0,0,0.176)' : 'rgba(0,0,0,0.627)';
+  bg.fillRect(0, 0, W, H);
+
+  var duration = state === TO_HEART ? GATHER_TIME : MORPH_TIME;
+  var denom = Math.max(duration - 0.9, 0.01);
+
+  for (var i = 0; i < particles.length; i++) {
+    var p = particles[i], gx, gy, gz;
+    if (morphing) {
+      var k = Math.min(Math.max((stateT - p.delay) / denom, 0), 1);
+      var e = easeIO(k);
+      if (state === TO_TEXT) { gx = p.trx; gy = p.tryy; gz = p.tz; }
+      else { var g = heartGoal(p.seed); gx = g[0]; gy = g[1]; gz = g[2]; }
+      p.wx = p.sx + (gx - p.sx) * e;
+      p.wy = p.sy + (gy - p.sy) * e;
+      p.wz = p.sz + (gz - p.sz) * e;
+    } else {
+      var jx, jy, jz;
+      if (state === HEART) {
+        var g2 = heartGoal(p.seed); gx = g2[0]; gy = g2[1]; gz = g2[2];
+        jx = 0.7*S*1.6; jy = jx; jz = 1.1*S*1.6;
+      } else {
+        gx = p.trx; gy = p.tryy; gz = p.tz;
+        jx = 0.5*S*1.6; jy = jx; jz = 0.7*S*1.6;
+      }
+      var kd = 0.14;
+      p.wx += (gx - p.wx) * kd + (Math.random()*2 - 1) * jx;
+      p.wy += (gy - p.wy) * kd + (Math.random()*2 - 1) * jy;
+      p.wz += (gz - p.wz) * kd + (Math.random()*2 - 1) * jz;
+    }
+
+    var pr = project(p.wx, p.wy, p.wz, tiltX);
+    var sx = pr[0], sy = pr[1], persp = pr[2];
+    p.shade = (state === TEXT || state === TO_TEXT) ? p.tshade : p.hshade;
+    var twk = 0.72 + 0.28 * Math.sin(nowS * 2.6 + p.phase);
+    var depth = Math.max(0.6, Math.min(1.25, persp));
+    var bb = twk * depth * p.shade;
+    var r = p.base[0]*bb, gr = p.base[1]*bb, bl = p.base[2]*bb;
+    bg.fillStyle = 'rgb(' + (r|0) + ',' + (gr|0) + ',' + (bl|0) + ')';
+    var rad = Math.max(1, Math.round(p.radius * persp * (isPhone ? 1.3 : 1)));
+    if (morphing && p.last) {
+      if (Math.abs(p.last[0]-sx) < 80 && Math.abs(p.last[1]-sy) < 80) {
+        bg.strokeStyle = bg.fillStyle;
+        bg.lineWidth = 1;
+        bg.beginPath();
+        bg.moveTo(p.last[0], p.last[1]);
+        bg.lineTo(sx, sy);
+        bg.stroke();
+      }
+    }
+    bg.fillRect(sx - rad/2, sy - rad/2, rad, rad);
+    p.last = [sx, sy];
+  }
+
+  hintEl.textContent = state === TEXT ? '轻触屏幕，让粒子重回爱心' : '轻触屏幕，让爱心化作文字';
+  hintEl.style.opacity = state === HEART || state === TEXT
+      ? String(0.45 + 0.4 * (0.5 + 0.5 * Math.sin(nowS * 2))) : '0';
+
+  requestAnimationFrame(frame);
+}
+
+/* ---------- 触摸 / 点击切换（pointer / touch / mouse 全兼容，带防抖） ---------- */
+function toggle() {
+  if (state === HEART) { state = TO_TEXT; stateT = 0; beginMorph(); }
+  else if (state === TEXT) { state = TO_HEART; stateT = 0; beginMorph(); }
+}
+var lastTap = 0;
+function onTap(e) {
+  if (e && e.cancelable !== undefined) e.preventDefault();
+  var t = Date.now();
+  if (t - lastTap < 450) return;   // 同一次点击可能触发多种事件，只响应一次
+  lastTap = t;
+  toggle();
+}
+stage.addEventListener('pointerdown', onTap, {passive: false});
+stage.addEventListener('touchstart', onTap, {passive: false});
+stage.addEventListener('mousedown', onTap);
+
+var _rt;
+window.addEventListener('resize', function() { clearTimeout(_rt); _rt = setTimeout(resize, 150); });
+window.addEventListener('orientationchange', function() { setTimeout(resize, 300); });
+
+resize();
+init();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
